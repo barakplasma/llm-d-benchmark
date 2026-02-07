@@ -4,13 +4,28 @@ Multi-Model GPU Planner
 A holistic tool for planning GPU infrastructure across multiple models simultaneously.
 Estimates total GPU requirements, electricity usage, and generates a procurement summary
 suitable for presenting to finance departments.
+
+Supports fetching real model metadata from HuggingFace for accurate memory estimates.
 """
 
 import streamlit as st
 import pandas as pd
 import json
 import math
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
+
+from src.config_explorer.capacity_planner import (
+    get_model_info_from_hf,
+    get_model_config_from_hf,
+    get_text_config,
+    model_memory_req,
+    model_total_params,
+    is_moe,
+    is_quantized,
+    get_quant_method,
+    precision_to_byte,
+)
 
 # ---------------------------------------------------------------------------
 # Load GPU database
@@ -23,7 +38,37 @@ def load_gpu_db():
         return json.load(f)
 
 # ---------------------------------------------------------------------------
-# Quantization helpers (lightweight, no HF calls)
+# HuggingFace fetch (cached to avoid repeated API calls)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def fetch_model_from_hf(model_id: str, hf_token: str | None):
+    """Fetch model info and config from HuggingFace. Returns (model_info, model_config) or raises."""
+    model_info = get_model_info_from_hf(model_id, hf_token)
+    model_config = get_model_config_from_hf(model_id, hf_token)
+    return model_info, model_config
+
+
+def detect_quant_option(model_config) -> str:
+    """Map a model's quantization config to one of our QUANT_OPTIONS keys."""
+    if not is_quantized(model_config):
+        return "BF16 (no quantization)"
+    method = get_quant_method(model_config)
+    try:
+        bpp = precision_to_byte(method)
+    except (ValueError, TypeError):
+        return "FP8"  # safe fallback for exotic quant methods
+    if bpp <= 0.5:
+        return "INT4"
+    if bpp <= 1.0:
+        # Distinguish FP8 vs INT8 by name
+        if "int" in method.lower():
+            return "INT8"
+        return "FP8"
+    return "BF16 (no quantization)"
+
+
+# ---------------------------------------------------------------------------
+# Quantization helpers
 # ---------------------------------------------------------------------------
 QUANT_OPTIONS = {
     "BF16 (no quantization)": 2.0,
@@ -55,6 +100,9 @@ class ModelEntry:
     pp: int = 1
     dp: int = 1
     gpu_type: str = "NVIDIA-H100-80GB-HBM3"
+    # When populated from HF, this holds the exact weight memory from SafeTensors
+    hf_weight_memory_gib: float | None = None
+    fetched: bool = False
 
     @property
     def bytes_per_param(self) -> float:
@@ -62,7 +110,9 @@ class ModelEntry:
 
     @property
     def model_memory_gib(self) -> float:
-        """Estimated model weight memory in GiB."""
+        """Model weight memory in GiB. Uses HF exact value if fetched, else estimates."""
+        if self.hf_weight_memory_gib is not None:
+            return self.hf_weight_memory_gib
         return self.params_billion * 1e9 * self.bytes_per_param / (1024**3)
 
     @property
@@ -115,6 +165,17 @@ def _init():
         st.session_state["gpus_per_server"] = 8
     if "pue" not in st.session_state:
         st.session_state["pue"] = DEFAULT_PUE
+    if "fetch_errors" not in st.session_state:
+        st.session_state["fetch_errors"] = {}
+
+
+def _get_hf_token() -> str | None:
+    """Return the HF token from sidebar input or env var."""
+    token = st.session_state.get("hf_token_input", "").strip()
+    if token:
+        return token
+    env = os.environ.get("HF_TOKEN", "").strip()
+    return env or None
 
 
 # ---------------------------------------------------------------------------
@@ -133,19 +194,39 @@ def main():
     gpu_db = load_gpu_db()
     gpu_names = list(gpu_db.keys())
 
+    # ── Sidebar: HuggingFace token ─────────────────────────────────────────
+    with st.sidebar:
+        st.header("HuggingFace Token")
+        st.text_input(
+            "HF Token (for gated models)",
+            type="password",
+            key="hf_token_input",
+            help="Paste your HuggingFace token here, or set HF_TOKEN env var. "
+                 "Required for gated models; optional for public models.",
+        )
+        hf_token = _get_hf_token()
+        if hf_token:
+            st.success("Token set")
+        else:
+            st.info("No token — public models only")
+
     # ── 1. Models to serve ─────────────────────────────────────────────────
     st.header("1 — Models to Serve")
-    st.caption("Add every model you plan to serve. Adjust quantization and parallelism per model.")
+    st.caption(
+        "Enter a HuggingFace model ID (e.g. `meta-llama/Llama-3.1-70B`) and click **Fetch** "
+        "to auto-populate parameters, quantization, and MoE status. "
+        "Or fill in the fields manually."
+    )
 
     models: list[ModelEntry] = st.session_state["fleet_models"]
 
-    cols_header = st.columns([2, 1.2, 1.2, 0.6, 0.6, 0.6, 0.6, 1.5])
-    headers = ["Model name", "Params (B)", "Quantization", "MoE?", "TP", "PP", "DP", "GPU type"]
+    cols_header = st.columns([2.2, 1.0, 1.2, 0.5, 0.5, 0.5, 0.5, 1.5, 0.7])
+    headers = ["Model name / HF ID", "Params (B)", "Quantization", "MoE?", "TP", "PP", "DP", "GPU type", ""]
     for c, h in zip(cols_header, headers):
         c.markdown(f"**{h}**")
 
     for i, m in enumerate(models):
-        cols = st.columns([2, 1.2, 1.2, 0.6, 0.6, 0.6, 0.6, 1.5])
+        cols = st.columns([2.2, 1.0, 1.2, 0.5, 0.5, 0.5, 0.5, 1.5, 0.7])
         m.name = cols[0].text_input("model", value=m.name, key=f"mn_{i}", label_visibility="collapsed",
                                      placeholder="e.g. meta-llama/Llama-3.1-70B")
         m.params_billion = cols[1].number_input("params", value=m.params_billion, min_value=0.1,
@@ -161,12 +242,64 @@ def main():
                                         index=gpu_names.index(m.gpu_type) if m.gpu_type in gpu_names else 0,
                                         key=f"mg_{i}", label_visibility="collapsed")
 
-    bcol1, bcol2 = st.columns(2)
+        # Fetch button
+        if cols[8].button("Fetch", key=f"fetch_{i}", help="Fetch model details from HuggingFace"):
+            if m.name.strip() and "/" in m.name:
+                with st.spinner(f"Fetching {m.name}..."):
+                    try:
+                        model_info, model_config = fetch_model_from_hf(m.name.strip(), hf_token)
+                        text_config = get_text_config(model_config)
+
+                        # Params
+                        total_params = model_total_params(model_info)
+                        m.params_billion = round(total_params / 1e9, 2)
+
+                        # Exact weight memory from SafeTensors
+                        m.hf_weight_memory_gib = model_memory_req(model_info, model_config)
+
+                        # MoE
+                        m.is_moe = is_moe(text_config)
+
+                        # Quantization
+                        m.quantization = detect_quant_option(model_config)
+
+                        m.fetched = True
+                        st.session_state["fetch_errors"].pop(i, None)
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state["fetch_errors"][i] = str(e)
+            else:
+                st.session_state["fetch_errors"][i] = "Enter a valid HF model ID (org/model)"
+
+        # Show fetch status or error
+        err = st.session_state["fetch_errors"].get(i)
+        if err:
+            st.error(f"Row {i+1}: {err}")
+        elif m.fetched:
+            st.caption(f"Row {i+1}: Fetched from HF — weight memory: {m.hf_weight_memory_gib:.2f} GiB (exact from SafeTensors)")
+
+    bcol1, bcol2, bcol3 = st.columns(3)
     if bcol1.button("+ Add model"):
         models.append(ModelEntry())
         st.rerun()
     if bcol2.button("- Remove last model") and len(models) > 1:
         models.pop()
+        st.rerun()
+    if bcol3.button("Fetch all models"):
+        for idx, m in enumerate(models):
+            if m.name.strip() and "/" in m.name and not m.fetched:
+                try:
+                    model_info, model_config = fetch_model_from_hf(m.name.strip(), hf_token)
+                    text_config = get_text_config(model_config)
+                    total_params = model_total_params(model_info)
+                    m.params_billion = round(total_params / 1e9, 2)
+                    m.hf_weight_memory_gib = model_memory_req(model_info, model_config)
+                    m.is_moe = is_moe(text_config)
+                    m.quantization = detect_quant_option(model_config)
+                    m.fetched = True
+                    st.session_state["fetch_errors"].pop(idx, None)
+                except Exception as e:
+                    st.session_state["fetch_errors"][idx] = str(e)
         st.rerun()
 
     # ── 2. Current GPU inventory ───────────────────────────────────────────
@@ -246,6 +379,7 @@ def main():
         fits = m.fits_on_gpu(gpu_mem)
         free_kv = round(m.per_gpu_free_for_kv(gpu_mem), 1)
         power_kw = round(total * tdp / 1000, 2)
+        source = "HF" if m.fetched else "manual"
 
         gpu_demand[m.gpu_type] = gpu_demand.get(m.gpu_type, 0) + total
 
@@ -262,6 +396,7 @@ def main():
             "Free for KV (GiB/GPU)": free_kv,
             "Fits?": "Yes" if fits else "NO",
             "Power (kW)": power_kw,
+            "Source": source,
         })
 
     df = pd.DataFrame(rows)
@@ -287,7 +422,7 @@ def main():
         have = owned.get(gpu_type, 0)
         to_buy = max(0, needed - have)
         tdp = gpu_db.get(gpu_type, {}).get("tdp_watts", 700)
-        power = needed * tdp / 1000  # kW from all GPUs of this type (owned + new)
+        power = needed * tdp / 1000
 
         proc_rows.append({
             "GPU type": gpu_type,
@@ -308,7 +443,7 @@ def main():
     total_gpus_needed = sum(gpu_demand.values())
     total_servers = math.ceil(total_gpus_needed / gpus_per_server)
     facility_power_kw = round(total_power_kw * pue, 2)
-    annual_kwh = round(facility_power_kw * 8760, 0)  # 24×365
+    annual_kwh = round(facility_power_kw * 8760, 0)
 
     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
     mcol1.metric("Total GPUs needed", total_gpus_needed)
@@ -366,11 +501,9 @@ Procurement by GPU type:
     for _, row in proc_df.iterrows():
         summary_text += f"  {row['GPU type']}: need {row['Total needed']}, own {row['Already owned']}, buy {row['To purchase']} (power: {row['Power draw (kW)']} kW)\n"
 
-    summary_text += f"""
-Models:
-"""
+    summary_text += "\nModels:\n"
     for _, row in df.iterrows():
-        summary_text += f"  {row['Model']}: {row['Params (B)']}B {row['Quant']}, {row['TP×PP×DP']}, {row['GPUs needed']}x {row['GPU type']}, fits={row['Fits?']}\n"
+        summary_text += f"  {row['Model']}: {row['Params (B)']}B {row['Quant']}, {row['TP×PP×DP']}, {row['GPUs needed']}x {row['GPU type']}, fits={row['Fits?']} ({row['Source']})\n"
 
     st.code(summary_text, language="text")
 
