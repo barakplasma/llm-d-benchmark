@@ -36,7 +36,7 @@ class Scenario:
     concurrency: int = 1
 
     # GPU
-    gpu_name: str = 'NVIDIA-H100-80GB-HBM3'
+    gpu_name: str = 'NVIDIA-H100-SXM-80GB'
     gpu_count_avail: int = 1
     gpu_mem_util: float = 0.9
 
@@ -75,7 +75,7 @@ class Scenario:
         self.max_model_len = 1
         self.concurrency = 1
 
-        self.gpu_name = 'NVIDIA-H100-80GB-HBM3'
+        self.gpu_name = 'NVIDIA-H100-SXM-80GB'
         self.gpu_count_avail = 1
         self.gpu_mem_util = 0.9
 

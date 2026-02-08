@@ -20,7 +20,7 @@ def register_new_accelerator():
     """
     Dialog to register a new accelerator type
     """
-    acc_name = st.text_input("Name", placeholder="NVIDIA-A100-40GB")
+    acc_name = st.text_input("Name", placeholder="NVIDIA-A100-SXM-80GB")
     acc_mem = st.number_input("Memory (GB)", min_value=1, step=1)
 
     if st.button("Register", use_container_width=True):
