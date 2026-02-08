@@ -13,6 +13,7 @@ import pandas as pd
 import json
 import math
 import os
+from collections import Counter
 from dataclasses import dataclass
 
 from src.config_explorer.capacity_planner import (
@@ -493,6 +494,76 @@ def main():
                 )
             else:
                 st.success(f"Fits in rack. Headroom: {rack_slots - total_servers} slots.")
+
+        # ── Server allocation visualization ───────────────────────────────
+        st.subheader("Server layout")
+        st.caption("Each table is one server. Columns show models hosted, rows show GPU slots.")
+
+        # Build allocation: pack model GPU-groups into servers by GPU type.
+        # A model's TP×PP GPUs form one group that must stay together on a
+        # server; DP creates independent replicas of that group.
+        servers: list[dict] = []  # {"gpu_type":str, "slots":list[str], "capacity":int}
+
+        for m in models:
+            spec = gpu_db.get(m.gpu_type, {})
+            gpu_mem = spec.get("memory", 80)
+            if not m.fits_on_gpu(gpu_mem):
+                continue  # skip models that don't fit
+
+            group_size = m.tp * m.pp  # GPUs that must be co-located
+            num_replicas = m.dp
+            model_label = m.name.split("/")[-1] if m.name else "(unnamed)"
+
+            for _replica in range(num_replicas):
+                # Find a server of the right GPU type with enough free slots
+                placed = False
+                for srv in servers:
+                    if srv["gpu_type"] != m.gpu_type:
+                        continue
+                    free = srv["capacity"] - len(srv["slots"])
+                    if free >= group_size:
+                        srv["slots"].extend([model_label] * group_size)
+                        placed = True
+                        break
+
+                if not placed:
+                    # Create a new server
+                    srv = {
+                        "gpu_type": m.gpu_type,
+                        "slots": [model_label] * group_size,
+                        "capacity": gpus_per_server,
+                    }
+                    servers.append(srv)
+
+        if servers:
+            for s_idx, srv in enumerate(servers):
+                gpu_short = srv["gpu_type"]
+                used = len(srv["slots"])
+                cap = srv["capacity"]
+
+                with st.expander(
+                    f"**Server {s_idx + 1}** — {gpu_short}  "
+                    f"({used}/{cap} GPUs used)",
+                    expanded=True,
+                ):
+                    # Build a table: one row per GPU slot, columns = Model + GPU#
+                    slot_rows = []
+                    for g_idx in range(cap):
+                        model_name = srv["slots"][g_idx] if g_idx < used else "— empty —"
+                        slot_rows.append({
+                            "GPU slot": f"GPU {g_idx}",
+                            "Model": model_name,
+                        })
+                    slot_df = pd.DataFrame(slot_rows)
+
+                    # Also build a summary: which models and how many GPUs each
+                    model_counts = Counter(srv["slots"])
+                    summary_parts = [f"{name} ×{cnt}" for name, cnt in model_counts.items()]
+
+                    st.markdown("**Models:** " + ", ".join(summary_parts))
+                    st.dataframe(slot_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No models fit — adjust configuration in the Models tab.")
 
         # ── Tables ────────────────────────────────────────────────────────
         st.subheader("GPU procurement by type")
