@@ -156,6 +156,66 @@ class InventoryItem:
 
 
 # ---------------------------------------------------------------------------
+# Server allocation (bin-packing)
+# ---------------------------------------------------------------------------
+def allocate_servers(
+    models: list[ModelEntry],
+    gpus_per_server: int,
+    gpu_db: dict,
+) -> tuple[list[dict], list[str]]:
+    """Pack model GPU-groups into servers using first-fit bin packing.
+
+    TP GPUs must be co-located on one server (NVLink).  PP stages can
+    span servers (network fabric).  DP creates independent replicas.
+
+    Returns ``(servers, errors)`` where each server is
+    ``{"gpu_type": str, "slots": list[str], "capacity": int}``
+    and *errors* lists human-readable messages for impossible configs.
+    """
+    servers: list[dict] = []
+    errors: list[str] = []
+
+    for m in models:
+        spec = gpu_db.get(m.gpu_type, {})
+        gpu_mem = spec.get("memory", 80)
+        if not m.fits_on_gpu(gpu_mem):
+            continue
+
+        tp_group = m.tp  # GPUs that must be co-located (one pipeline stage)
+        model_label = m.name.split("/")[-1] if m.name else "(unnamed)"
+
+        if tp_group > gpus_per_server:
+            errors.append(
+                f"**{model_label}**: TP={m.tp} requires {tp_group} GPUs on one "
+                f"server, but servers only have {gpus_per_server} GPUs. "
+                "Reduce TP or increase GPUs per server."
+            )
+            continue
+
+        for _replica in range(m.dp):
+            for _stage in range(m.pp):
+                placed = False
+                for srv in servers:
+                    if srv["gpu_type"] != m.gpu_type:
+                        continue
+                    free = srv["capacity"] - len(srv["slots"])
+                    if free >= tp_group:
+                        srv["slots"].extend([model_label] * tp_group)
+                        placed = True
+                        break
+
+                if not placed:
+                    srv = {
+                        "gpu_type": m.gpu_type,
+                        "slots": [model_label] * tp_group,
+                        "capacity": gpus_per_server,
+                    }
+                    servers.append(srv)
+
+    return servers, errors
+
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 def _init():
@@ -449,8 +509,11 @@ def main():
 
         proc_df = pd.DataFrame(proc_rows)
 
+        # ── Server allocation (bin-packing) ──────────────────────────
+        servers, allocation_errors = allocate_servers(models, gpus_per_server, gpu_db)
+
         total_gpus = sum(gpu_demand.values())
-        total_servers = math.ceil(total_gpus / gpus_per_server)
+        total_servers = len(servers) if servers else math.ceil(total_gpus / gpus_per_server)
         facility_kw = round(total_power_kw * pue, 2)
         annual_kwh = round(facility_kw * 8760, 0)
 
@@ -497,43 +560,13 @@ def main():
 
         # ── Server allocation visualization ───────────────────────────────
         st.subheader("Server layout")
-        st.caption("Each table is one server. Columns show models hosted, rows show GPU slots.")
+        st.caption(
+            "Each table is one server. Columns show models hosted, rows show GPU slots. "
+            "TP GPUs are co-located on one server; PP stages may span servers."
+        )
 
-        # Build allocation: pack model GPU-groups into servers by GPU type.
-        # A model's TP×PP GPUs form one group that must stay together on a
-        # server; DP creates independent replicas of that group.
-        servers: list[dict] = []  # {"gpu_type":str, "slots":list[str], "capacity":int}
-
-        for m in models:
-            spec = gpu_db.get(m.gpu_type, {})
-            gpu_mem = spec.get("memory", 80)
-            if not m.fits_on_gpu(gpu_mem):
-                continue  # skip models that don't fit
-
-            group_size = m.tp * m.pp  # GPUs that must be co-located
-            num_replicas = m.dp
-            model_label = m.name.split("/")[-1] if m.name else "(unnamed)"
-
-            for _replica in range(num_replicas):
-                # Find a server of the right GPU type with enough free slots
-                placed = False
-                for srv in servers:
-                    if srv["gpu_type"] != m.gpu_type:
-                        continue
-                    free = srv["capacity"] - len(srv["slots"])
-                    if free >= group_size:
-                        srv["slots"].extend([model_label] * group_size)
-                        placed = True
-                        break
-
-                if not placed:
-                    # Create a new server
-                    srv = {
-                        "gpu_type": m.gpu_type,
-                        "slots": [model_label] * group_size,
-                        "capacity": gpus_per_server,
-                    }
-                    servers.append(srv)
+        for err in allocation_errors:
+            st.error(err)
 
         if servers:
             for s_idx, srv in enumerate(servers):
